@@ -17,6 +17,7 @@ ENDPOINTS = {
     "abort": "/api/bot/game/{}/abort",
     "accept": "/api/challenge/{}/accept",
     "decline": "/api/challenge/{}/decline",
+    "challenge": "/api/challenge/{}",
     "upgrade": "/api/bot/account/upgrade",
     "resign": "/api/bot/game/{}/resign"
 }
@@ -98,6 +99,9 @@ class Lichess:
     def decline_challenge(self, challenge_id, reason="generic"):
         return self.api_post(ENDPOINTS["decline"].format(challenge_id), data=f"reason={reason}", headers={"Content-Type": "application/x-www-form-urlencoded"})
 
+    def send_challenge(self, target):
+        return self.api_post(ENDPOINTS["challenge"].format(target))
+    
     def get_profile(self):
         profile = self.api_get(ENDPOINTS["profile"])
         self.set_user_agent(profile["username"])

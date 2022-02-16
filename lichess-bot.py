@@ -1,4 +1,5 @@
 import argparse
+from distutils.command.config import config
 import chess
 from chess.variant import find_variant
 import chess.polyglot
@@ -99,7 +100,7 @@ def game_logging_configurer(queue, level):
         root.setLevel(level)
 
 
-def start(li, user_profile, engine_factory, config, logging_level, log_filename, one_game=False):
+def start(li, user_profile, engine_factory, config, logging_level, log_filename, opponent):
     challenge_config = config["challenge"]
     max_games = challenge_config.get("concurrency", 1)
     logger.info("You're now connected to {} and awaiting challenges.".format(config["url"]))
@@ -116,6 +117,8 @@ def start(li, user_profile, engine_factory, config, logging_level, log_filename,
     correspondence_queue.put("")
     startup_correspondence_games = [game["gameId"] for game in li.get_ongoing_games() if game["perf"] == 'correspondence']
     wait_for_correspondence_ping = False
+
+    opponent_challenged = False
 
     busy_processes = 0
     queued_processes = 0
@@ -143,11 +146,9 @@ def start(li, user_profile, engine_factory, config, logging_level, log_filename,
             elif event["type"] == "local_game_done":
                 busy_processes -= 1
                 logger.info("+++ Process Free. Total Queued: {}. Total Used: {}".format(queued_processes, busy_processes))
-                if one_game:
-                    break
             elif event["type"] == "challenge":
                 chlng = model.Challenge(event["challenge"])
-                if chlng.is_supported(challenge_config):
+                if chlng.is_supported(challenge_config) or chlng.challenger_name == opponent:
                     challenge_queue.append(chlng)
                     if (challenge_config.get("sort_by", "best") == "best"):
                         list_c = list(challenge_queue)
@@ -204,19 +205,29 @@ def start(li, user_profile, engine_factory, config, logging_level, log_filename,
                         busy_processes += 1
                         logger.info("--- Process Used. Total Queued: {}. Total Used: {}".format(queued_processes, busy_processes))
                         pool.apply_async(play_game, [li, game_id, control_queue, engine_factory, user_profile, config, challenge_queue, correspondence_queue, logging_queue, game_logging_configurer, logging_level])
-
-            while ((queued_processes + busy_processes) < max_games and challenge_queue):  # keep processing the queue until empty or max_games is reached
-                chlng = challenge_queue.pop(0)
-                try:
-                    logger.info("Accept {}".format(chlng))
-                    queued_processes += 1
-                    li.accept_challenge(chlng.id)
-                    logger.info("--- Process Queue. Total Queued: {}. Total Used: {}".format(queued_processes, busy_processes))
-                except (HTTPError, ReadTimeout) as exception:
-                    if isinstance(exception, HTTPError) and exception.response.status_code == 404:  # ignore missing challenge
-                        logger.info("Skip missing {}".format(chlng))
-                    queued_processes -= 1
-
+            if not len(opponent) > 0:
+            	while ((queued_processes + busy_processes) < max_games and challenge_queue):  # keep processing the queue until empty or max_games is reached.
+                    chlng = challenge_queue.pop(0)
+                    try:
+                        logger.info("Accept {}".format(chlng))
+                        queued_processes += 1
+                        li.accept_challenge(chlng.id)
+                        logger.info("--- Process Queue. Total Queued: {}. Total Used: {}".format(queued_processes, busy_processes))
+                    except (HTTPError, ReadTimeout) as exception:
+                        if isinstance(exception, HTTPError) and exception.response.status_code == 404:  # ignore missing challenge
+                            logger.info("Skip missing {}".format(chlng))
+                            queued_processes -= 1
+            else:
+                game_found = False
+                for challenge in challenge_queue:
+                    if challenge.challenger_name == opponent:
+                        game_found = True
+                        li.accept_challenge(challenge)
+                        break
+                if not game_found and not opponent_challenged:
+                    li.send_challenge(opponent)
+                    opponent_challenged = True
+                        
             control_queue.task_done()
 
     logger.info("Terminated")
@@ -347,7 +358,6 @@ def play_game(li, game_id, control_queue, engine_factory, user_profile, config, 
         correspondence_queue.put(game_id)
     else:
         logger.info("--- {} Game over".format(game.url()))
-
     control_queue.put_nowait({"type": "local_game_done"})
 
 
@@ -680,32 +690,39 @@ def intro():
     """ % __version__
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Play on Lichess with a bot')
-    parser.add_argument('-u', action='store_true', help='Add this flag to upgrade your account to a bot account.')
-    parser.add_argument('-v', action='store_true', help='Verbose output. Changes log level from INFO to DEBUG.')
-    parser.add_argument('--config', help='Specify a configuration file (defaults to ./config.yml)')
-    parser.add_argument('-l', '--logfile', help="Log file to append logs to.", default=None)
-    args = parser.parse_args()
-
+def start_bot(config_path="./config.yml", cmdline=False, opponent=""):
+    if cmdline:
+        parser = argparse.ArgumentParser(description='Play on Lichess with a bot')
+        parser.add_argument('-u', action='store_true', help='Add this flag to upgrade your account to a bot account.')
+        parser.add_argument('-v', action='store_true', help='Verbose output. Changes log level from INFO to DEBUG.')
+        parser.add_argument('--config', help='Specify a configuration file (defaults to ./config.yml)')
+        parser.add_argument('-l', '--logfile', help="Log file to append logs to.", default=None)
+        args = parser.parse_args()
+   
     logging_level = logging.DEBUG if args.v else logging.INFO
     logging.basicConfig(level=logging_level, filename=args.logfile,
                         format="%(asctime)-15s: %(message)s")
     enable_color_logging(debug_lvl=logging_level)
     logger.info(intro())
-    CONFIG = load_config(args.config or "./config.yml")
+
+    CONFIG = load_config(args.config or config_path)
     li = lichess.Lichess(CONFIG["token"], CONFIG["url"], __version__, logging_level)
 
     user_profile = li.get_profile()
     username = user_profile["username"]
     is_bot = user_profile.get("title") == "BOT"
     logger.info("Welcome {}!".format(username))
+    
+    if opponent:
+        specific_match = True
 
     if args.u and not is_bot:
         is_bot = upgrade_account(li)
-
+    
     if is_bot:
         engine_factory = partial(engine_wrapper.create_engine, CONFIG)
-        start(li, user_profile, engine_factory, CONFIG, logging_level, args.logfile)
+        start(li, user_profile, engine_factory, CONFIG, logging_level, args.logfile, opponent)
     else:
         logger.error("{} is not a bot account. Please upgrade it to a bot account!".format(user_profile["username"]))
+if __name__ == "__main__":
+    start_bot(cmdline=True)
